@@ -1,305 +1,358 @@
-'''
-Main script for training stable dynamics using Euclideanizing flows on LASA handwriting dataset
-
-Ref: M. Asif Rana et al, Euclideanizing Flows: Diffeomorphic Reduction for Learning Stable Dynamical Systems, L4DC 2020
-(https://arxiv.org/pdf/2005.13143.pdf)
-'''
-
-from __future__ import print_function
-import torch.optim as optim
-from torch.utils.data import TensorDataset
-from flows import *
-from train_utils import *
-from plot_utils import *
-from data_utils import *
-import argparse
-from matplotlib import rcParams
-
-parser = argparse.ArgumentParser(description='Euclideanizing flows for learning stable dynamical systems')
-
-parser.add_argument(
-    '--data-name',
-    type=str,
-    default='Sshape',
-    help='name of the letter in LASA dataset')
-
-args = parser.parse_args()
-
-# ---------------
-# params
-data_name = args.data_name
-test_learner_model = True               # to plot the rollouts and vector fields
-load_learner_model = True              # to load a saved model
-coupling_network_type = 'rffn'          # rffn/fcnn (specify random fourier features or neural network for coupling layer)
-plot_resolution = 0.011                  # plotting resolution (only use for testing)
-
-# -----------------------------------------------------------------------
-# learner params (for normalizing flows)
-if coupling_network_type == 'fcnn':         # neural network parameterization
-    num_blocks = 10                        # number of coupling layers
-    num_hidden = 200                       # hidden layer dimensions (there are two of hidden layers)
-    # only for fcnn!
-    t_act = 'elu'                           # activation fcn in each network (must be continuously differentiable!)
-    s_act = 'elu'
-
-    minibatch_mode = False                   # True uses the batch_size arg below
-    batch_size = 64                         # size of minibatch
-    learning_rate = 0.0005
-    sigma = None                            # not required for fcnn
-    print('WARNING: FCNN params are not tuned!! ')
-
-elif coupling_network_type == 'rffn':       # random fourier features parameterization
-    num_blocks =15                        # number of coupling layers
-    num_hidden = 100                        # number of random fourier features per block
-    sigma = .65              # length scale for random fourier features
-
-    minibatch_mode = False
-    batch_size = 64
-    s_act = None                            # not required for rffn
-    t_act = None                            # not required for rffn
-    learning_rate = 0.00088
-
-else:
-    raise TypeError('Coupling layer network not defined!')
-
-# ------------------------------------------------------------------
-# Training params
-
-eps = 1e-12
-no_cuda = True          # TODO: cuda compatibility not tested fully!
-seed = None
-weight_regularizer = 1e-8
-epochs = 500
-loss_clip = 1e3
-clip_gradient = True
-clip_value_grad = 0.1
-log_freq = 10
-plot_freq = 200
-stopping_thresh = 250
-
-cuda = not no_cuda and torch.cuda.is_available()
-device = torch.device("cuda:0" if cuda else "cpu")
-
-if seed is not None:
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    if cuda:
-        torch.cuda.manual_seed(seed)
-
-kwargs = {'num_workers': 4, 'pin_memory': True} if cuda else {}
-
-# ---------------------------------------------------------------
-print('Loading dataset...')
-
-dataset = LASA(data_name=data_name)
-# dataset.plot_data()
-
-goal = dataset.goal
-idx = dataset.idx
-
-x_train = dataset.x
-xd_train = dataset.xd
-
-scaling = torch.from_numpy(dataset.scaling).float()
-translation = torch.from_numpy(dataset.translation).float()
-
-# normalize_ = lambda x: x * scaling + translation
-# denormalize_ = lambda x: (x - translation) / scaling
-
-n_dims = dataset.n_dims
-n_pts = dataset.n_pts
-
-dt = dataset.dt
-
-dataset_list = []
-time_list = []
-expert_traj_list = []
-s0_list = []
-t_final_list = []
-for n in range(len(idx) - 1):
-    x_traj_tensor = torch.from_numpy(x_train[idx[n]:idx[n + 1]])
-    xd_traj_tensor = torch.from_numpy(xd_train[idx[n]:idx[n + 1]])
-    s0_list.append(x_traj_tensor[0].numpy())
-    traj_dataset = torch.utils.data.TensorDataset(x_traj_tensor, xd_traj_tensor)
-    expert_traj_list.append(x_traj_tensor)
-    dataset_list.append(traj_dataset)
-    t_final = dt * (x_traj_tensor.shape[0] - 1)
-    t_final_list.append(t_final)
-    t_eval = np.arange(0., t_final + dt, dt)
-    time_list.append(t_eval)
-
-n_experts = len(dataset_list)
-x_train = dataset.x
+import torch
+import torch.nn as nn
+from torch import autograd
+import torch.nn.functional as F
+import numpy as np
+
 
-x_train_tensor = torch.from_numpy(x_train)
+class NaturalGradientDescentVelNet(nn.Module):
+	"""
+	taskmap_fcn: map to a latent space
+	grad_taskmap_fcn: jacobian of the map
+	grad_potential_fcn: gradient of a potential fcn defined on the mapped space
+	n_dim_x: observed (input) space dimensions
+	n_dim_y: latent (output) space dimentions
+	origin (optional): shifted origin of the input space (this is the goal usually)
+	scale_vel (optional): if set to true, learns a scalar velocity multiplier
+	is_diffeomorphism (optional): if set to True, use the inverse of the jacobian itself rather than pseudo-inverse
+	"""
+	def __init__(self, taskmap_fcn, grad_potential_fcn, n_dim_x, n_dim_y,
+				  eps=1e-12, device='cpu',dt = 0.01):
 
-xd_train = dataset.xd
-xd_train_tensor = torch.from_numpy(xd_train)
-
-if not minibatch_mode:
-    batch_size = xd_train.shape[0]
-
-#  ------------------------------------------
-# finding the data range
-
-xmin = np.min(x_train[:, 0])
-xmax = np.max(x_train[:, 0])
-ymin = np.min(x_train[:, 1])
-ymax = np.max(x_train[:, 1])
-
-x_lim = [[xmin - 0.1, xmax + 0.1], [ymin - 0.1, ymax + 0.1]]
-
-
-# --------------------------------------------------------------------------------
-# Learner setup
-
-# bijection network
-taskmap_net = BijectionNet(num_dims=n_dims, num_blocks=num_blocks, num_hidden=num_hidden, s_act=s_act, t_act=t_act,
-                           sigma=sigma,
-                           coupling_network_type=coupling_network_type)
-
-
-y_pot_grad_fcn = lambda y: F.normalize(y,dim=1)   # potential fcn gradient (can use quadratic potential instead)
-
-# pulled back dynamics (natural gradient descent system)
-euclideanization_net = NaturalGradientDescentVelNet(taskmap_fcn= taskmap_net,
-                                                    grad_potential_fcn=y_pot_grad_fcn,
-                                                    n_dim_x=n_dims,
-                                                    n_dim_y=n_dims,
-                                                    eps=eps,
-                                                    device=device,
-                                                    dt = dt)
-learner_model = euclideanization_net
-
-if not load_learner_model:
-    print('Training model ...')
-    # Training learner
-    optimizer = optim.AdamW(learner_model.parameters(), lr=learning_rate, weight_decay=weight_regularizer)
-    criterion = nn.SmoothL1Loss()
-    loss_fn = criterion
-
-    dataset = TensorDataset(x_train_tensor, xd_train_tensor)
-    learner_model.train()
-    best_model, train_loss = \
-        train(learner_model, loss_fn, optimizer, dataset, epochs, batch_size=batch_size, stop_threshold=stopping_thresh)
-
-    print(
-        'Training loss: {:.4f}'.
-            format(train_loss))
-
-    try:
-        os.makedirs('models')
-    except OSError:
-        pass
-
-    learner_model = best_model
-    torch.save(learner_model.state_dict(), os.path.join('models', '{}.pt'.format(data_name)))
-
-else:
-    print('Loading model ...')
-    # Loading learner
-    learner_model.load_state_dict(torch.load(os.path.join('models', '{}.pt'.format(data_name))))
-
-# ---------------------------------------------------------
-# Plotting best results
-vvvia_point =torch.Tensor((0.6,0.05))#
-via_point = torch.Tensor((0.6,0.05))#vvvia_point*scaling.squeeze(0)
-# print(via_point.shape)
-
-if test_learner_model:
-    print('Plotting rollouts and vector fields. This may take a few moments ...')
-    learner_model.eval()
-    learner_traj_list = []
-    learner_traj_list2 = []
-
-    # rollout trajectories
-    for n in range(n_experts):
-        s0 = s0_list[n]
-        t_final = t_final_list[n]
-
-        learner_traj = generate_trajectories(learner_model, s0, order=1, via_point=via_point,return_label=False,
-                                             t_step=dt, t_final=1.2 * t_final,
-                                             method='euler')
-
-        learner_traj_list.append(learner_traj[0])
-        learner_traj_list2.append(learner_traj[1])
-
-    # visualize vector field and potentials
-    taskmap1_net = learner_model.taskmap_fcn
-    potential_fcn = lambda x: torch.norm(taskmap1_net(x), dim=1)
-
-
-
-
-    x1_test = np.arange(x_lim[0][0], x_lim[0][1], plot_resolution)
-    x2_test = np.arange(x_lim[1][0], x_lim[1][1], plot_resolution)
-    X1, X2 = np.meshgrid(x1_test, x2_test)
-    x_test = np.concatenate((X1.flatten().reshape(-1, 1), X2.flatten().reshape(-1, 1)), 1)
-
-    x_test_tensor = torch.from_numpy(x_test).float()
-    z_test_tensor = potential_fcn(x_test_tensor)
-    z_test = z_test_tensor.detach().cpu().numpy()
-
-    max_z = np.max(z_test)
-    min_z = np.min(z_test)
-    z_test = (z_test - min_z) / (max_z - min_z)
-    Z = z_test.reshape(X1.shape[0], X1.shape[1])
-##===================================================================================##
-
-
-    fig1 = plt.figure()
-    ax1 = plt.gca()
-    ax1.set_xlim(x_lim[0])
-    ax1.set_ylim(x_lim[1])
-    plt.xticks([])
-    plt.yticks([])
-    plt.tight_layout()
-    ax1.imshow(Z, extent=[x_lim[0][0], x_lim[0][1], x_lim[1][0], x_lim[1][1]], origin='lower', cmap='viridis')
-    # ax1.axis(aspect='image')
-    visualize_vel(learner_model, x_lim=x_lim, delta=plot_resolution, cmap=None, color='#f2e68f')
-
-    fig2 = plt.figure()
-    ax2 = plt.gca()
-    ax2.set_xlim(x_lim[0])
-    ax2.set_ylim(x_lim[1])
-    plt.xticks([])
-    plt.yticks([])
-    plt.tight_layout()
-    ax2.imshow(Z, extent=[x_lim[0][0], x_lim[0][1], x_lim[1][0], x_lim[1][1]], origin='lower', cmap='viridis')
-    # ax2.axis(aspect='image')
-    contours = plt.contour(X1, X2, Z, 25, cmap=None, colors='#f2e68f')
-
-    expert_traj_list = [traj.numpy() for traj in expert_traj_list]
-    learner_traj_list = [traj.numpy() for traj in learner_traj_list]
-
-    for n in range(n_experts):
-        expert_traj = expert_traj_list[n]
-        learner_traj = learner_traj_list[n]
-
-        ax1.plot(expert_traj[:, 0], expert_traj[:, 1], 'w', linewidth=4, linestyle=':')
-        ax1.plot(learner_traj[:, 0], learner_traj[:, 1], 'r', linewidth=3)
-        ax1.plot(expert_traj[-1, 0], expert_traj[-1, 1], 'xg', linewidth=10, markersize=12, markeredgecolor='black')
-        if via_point is not None:
-            # via_point = np.squeeze(np.array(via_point) / scaling,0)
-            ax1.plot(vvvia_point[0], vvvia_point[1], 'o', color=(0.5, 0, 0.5), linewidth=1.5, markersize=10,
-                     markeredgecolor=(0.5, 0, 0.5))
-
-        ax2.plot(expert_traj[:, 0], expert_traj[:, 1], 'w', linewidth=4, linestyle=':')
-        ax2.plot(learner_traj[:, 0], learner_traj[:, 1], 'r', linewidth=3)
-        ax2.plot(expert_traj[-1, 0], expert_traj[-1, 1], 'xg', linewidth=10, markersize=12, markeredgecolor='black')
-        if via_point is not None:
-            ax2.plot(via_point[0], via_point[1], 'o', linewidth=10, markersize=10, markeredgecolor='black')
-
-
-    try:
-        os.makedirs('plots')
-    except OSError:
-        pass
-
-    # fig1.savefig(os.path.join('plots', '{}_vector_field.pdf'.format(data_name)), dpi=300)
-    # fig2.savefig(os.path.join('plots', '{}_contour_plot.pdf'.format(data_name)), dpi=300)
-
-    plt.show()
+		super(NaturalGradientDescentVelNet, self).__init__()
+		self.taskmap_fcn = taskmap_fcn
+		# self.grad_potential_fcn = grad_potential_fcn
+		self.n_dim_x = n_dim_x
+		self.n_dim_y = n_dim_y
+		self.eps = eps
+		self.linear = nn.Linear(1,1,bias=None)
+		self.dt = dt
+
+
+
+
+	def forward(self, x,via_point=None):
+
+		y_hat = self.taskmap_fcn(x)
+		y_hat = y_hat.reshape(-1,2)
+
+		v_now = torch.bmm(y_hat.unsqueeze(1),y_hat.unsqueeze(2)).squeeze(1).squeeze(1)
+	
+		if via_point is not None:
+			via_point = via_point.unsqueeze(0)
+			via_point_plane = self.taskmap_fcn(via_point)
+			k_plane = via_point_plane[:,1]/via_point_plane[:,0]
+
+			wg = torch.sqrt(k_plane**2+1)
+
+			v_via_point = torch.mm(via_point_plane,via_point_plane.transpose(0,1)).squeeze(1)
+			if v_now >= v_via_point/2:
+				x_plane_now = torch.sqrt(v_now)/wg
+
+				flg = F.relu(-via_point_plane[0][0]) / (via_point_plane[0][0] + 1e-8)  # 正为0 负为-1
+
+				x_plane_now = x_plane_now + 2 * flg * x_plane_now
+				y_plane_now = x_plane_now*k_plane
+
+				x_plane_now = x_plane_now.unsqueeze(1)
+				y_plane_now = y_plane_now.unsqueeze(1)
+				xy_plane_now = torch.cat((x_plane_now,y_plane_now),1)
+				xy_plane_now_v = -F.normalize(xy_plane_now)
+
+				xy_plane_next = xy_plane_now+0.2*xy_plane_now_v
+
+				yd_hat = F.normalize(xy_plane_next-y_hat)
+				y_hat_now = y_hat + 0.01 * yd_hat
+
+				y_hat_now1 = y_hat_now.unsqueeze(2)
+				y_hat1 = y_hat.unsqueeze(2)
+				y_hat_flag = -torch.bmm(y_hat_now1.transpose(1, 2), y_hat1).squeeze(1)  # 800 1 1
+				y_hat_flag_relu = F.relu(y_hat_flag) / (y_hat_flag + 1e-8)
+				y_hat_flag_reluu = y_hat_flag_relu.repeat(1, y_hat_flag_relu.shape[1])
+				y_hat_now = y_hat_now - y_hat_flag_reluu * y_hat_now
+
+				x_hat_now = self.taskmap_fcn(y_hat_now, mode="inverse")
+				xd = (x_hat_now - x) / self.dt
+				# yy=self.taskmap_fcn(x_hat_now)
+
+
+				return xd, y_hat
+			else:
+				yd_hat = -F.normalize(y_hat)
+				y_hat_now = y_hat + 0.01 * yd_hat
+
+				y_hat_now1 = y_hat_now.unsqueeze(2)
+				y_hat1 = y_hat.unsqueeze(2)
+				y_hat_flag = -torch.bmm(y_hat_now1.transpose(1, 2), y_hat1).squeeze(1)  # 800 1 1
+				y_hat_flag_relu = F.relu(y_hat_flag) / (y_hat_flag + 1e-8)
+				y_hat_flag_reluu = y_hat_flag_relu.repeat(1, y_hat_flag_relu.shape[1])
+				y_hat_now = y_hat_now - y_hat_flag_reluu * y_hat_now
+
+				x_hat_now = self.taskmap_fcn(y_hat_now, mode="inverse")
+				# print(self.taskmap_fcn(x_hat_now)-y_hat_now)
+
+				xd = (x_hat_now - x) / self.dt
+				# yy = self.taskmap_fcn(x_hat_now)
+				return xd, y_hat
+
+		#
+
+		#
+		else:
+			yd_hat = -F.normalize(y_hat,dim=1)  # negative gradient of potential
+
+			y_hat_now = y_hat + 0.01 * yd_hat
+			# print(F.normalize(y_hat_now)+yd_hat)
+
+			y_hat_now1 = y_hat_now.unsqueeze(2)
+			y_hat1 = y_hat.unsqueeze(2)
+			y_hat_flag = -torch.bmm(y_hat_now1.transpose(1,2),y_hat1).squeeze(1)# 800 1 1
+			y_hat_flag_relu = F.relu(y_hat_flag)/(y_hat_flag+1e-8)
+			y_hat_flag_reluu = y_hat_flag_relu.repeat(1,y_hat_flag_relu.shape[1])
+			y_hat_now = y_hat_now - y_hat_flag_reluu*y_hat_now
+
+			x_hat_now = self.taskmap_fcn(y_hat_now,mode="inverse")
+			xd = (x_hat_now-x)/self.dt
+			# yy = self.taskmap_fcn(x_hat_now)
+			# print(yy)
+
+			return xd,y_hat
+
+
+class BijectionNet(nn.Sequential):
+	"""
+	A sequential container of flows based on coupling layers.
+	"""
+	def __init__(self, num_dims, num_blocks, num_hidden, s_act=None, t_act=None, sigma=None,
+				 coupling_network_type='fcnn'):
+		self.num_dims = num_dims
+		modules = []
+		# print('Using the {} for coupling layer'.format(coupling_network_type))
+		mask = torch.arange(0, num_dims) % 2  # alternating inputs
+		mask = mask.float()
+		# mask = mask.to(device).float()
+		for _ in range(num_blocks):
+			modules += [
+				CouplingLayer(
+					num_inputs=num_dims, num_hidden=num_hidden, mask=mask,
+					s_act=s_act, t_act=t_act, sigma=sigma, base_network=coupling_network_type),
+			]
+			mask = 1 - mask  # flipping mask
+		super(BijectionNet, self).__init__(*modules)
+
+
+
+	def forward(self, inputs, mode='direct'):
+		""" Performs a forward or backward pass for flow modules.
+		Args:
+			inputs: a tuple of inputs and logdets
+			mode: to run direct computation or inverse
+		"""
+		assert mode in ['direct', 'inverse']
+		# batch_size = inputs.size(0)
+		# J = torch.eye(self.num_dims, device=inputs.device).unsqueeze(0).repeat(batch_size, 1, 1)
+
+		if mode == 'direct':
+			for module in self._modules.values():
+				# J_module = module.jacobian(inputs)
+				# J = torch.matmul(J_module, J)
+				inputs = module(inputs, mode)
+		else:
+			for module in reversed(self._modules.values()):
+				# J_module = module.jacobian(inputs)
+				# J = torch.matmul(J_module, J)
+				inputs = module(inputs, mode)
+		return inputs
+
+
+
+class CouplingLayer(nn.Module):
+	""" An implementation of a coupling layer
+	from RealNVP (https://arxiv.org/abs/1605.08803).
+	"""
+
+	def __init__(self, num_inputs, num_hidden, mask,
+				 base_network='rffn', s_act='elu', t_act='elu', sigma=0.45):
+		super(CouplingLayer, self).__init__()
+
+		self.num_inputs = num_inputs
+		self.mask = mask
+
+		if base_network == 'fcnn':
+			self.scale_net = FCNN(in_dim=2, out_dim=2, hidden_dim=num_hidden, act=s_act)
+			self.translate_net = FCNN(in_dim=2, out_dim=2, hidden_dim=num_hidden, act=t_act)
+			# print('Using neural network initialized with identity map!')
+
+			nn.init.zeros_(self.translate_net.network[-1].weight.data)
+			nn.init.zeros_(self.translate_net.network[-1].bias.data)
+
+
+		elif base_network == 'rffn':
+			print('Using random fouier feature with bandwidth = {}.'.format(sigma))
+			self.scale_net = RFFN(in_dim=num_inputs, out_dim=num_inputs, nfeat=num_hidden, sigma=sigma)
+			self.translate_net = RFFN1(in_dim=num_inputs, out_dim=num_inputs, nfeat=num_hidden, sigma=sigma)
+
+			print('Initializing coupling layers as identity!')
+			nn.init.zeros_(self.translate_net.network[-1].weight.data)
+			nn.init.zeros_(self.scale_net.network[-1].weight.data)
+			# nn.init.zeros_(self.translate_net.network[-1].weight.data)
+			# nn.init.zeros_(self.scale_net.network[-1].weight.data)
+		else:
+			raise TypeError('The network type has not been defined')
+
+	def forward(self, inputs, mode='direct'):
+		mask = self.mask
+		masked_inputs = inputs * mask
+		# masked_inputs.requires_grad_(True)
+
+		log_s =self.scale_net(masked_inputs) * (1 - mask)
+		t =self.translate_net(masked_inputs)* (1 - mask)
+
+		if mode == 'direct':
+			s = torch.exp(log_s)
+			return inputs * s + t
+		else:
+			s = torch.exp(-log_s)
+			return (inputs - t) * s
+
+class RFFN(nn.Module):
+	"""
+	Random Fourier features network.
+	"""
+
+	def __init__(self, in_dim, out_dim, nfeat, sigma=10.): # 2 2 100
+		super(RFFN, self).__init__()
+		self.sigma = np.ones(in_dim) * sigma #
+		self.coeff = np.random.normal(0.0, 2, (nfeat, in_dim))
+		self.coeff = self.coeff / self.sigma.reshape(1, len(self.sigma))
+		self.offset = 2.0 * np.pi * np.random.rand(1, nfeat)
+
+		self.network = nn.Sequential(
+			LinearClamped(in_dim, nfeat, self.coeff, self.offset),
+			Cos(),
+			nn.Linear(nfeat, out_dim, bias=True),
+			# nn.ELU(),
+			# nn.Linear(out_dim, out_dim, bias=True),
+
+		)
+
+	def forward(self, x):
+		return self.network(x)
+
+
+class RFFN1(nn.Module):
+	"""
+	Random Fourier features network.
+	"""
+
+	def __init__(self, in_dim, out_dim, nfeat, sigma=10.): # 2 2 100
+		super(RFFN1, self).__init__()
+		self.sigma = np.ones(in_dim) * sigma #
+		self.coeff = np.random.normal(0.0, 2, (nfeat, in_dim))
+		self.coeff = self.coeff / self.sigma.reshape(1, len(self.sigma))
+		self.offset = 2.0 * np.pi * np.random.rand(1, nfeat)
+
+		self.network = nn.Sequential(
+			LinearClamped1(in_dim, nfeat, self.coeff, self.offset),
+			Sin(),
+			nn.Linear(nfeat, out_dim, bias=False),
+			# nn.ELU(),
+			# nn.Linear(out_dim, out_dim, bias=False),
+		)
+
+	def forward(self, x):
+		return self.network(x)
+
+
+class FCNN(nn.Module):
+	'''
+	2-layer fully connected neural network
+	'''
+
+	def __init__(self, in_dim, out_dim, hidden_dim, act='tanh'):
+		super(FCNN, self).__init__()
+		activations = {'relu': nn.ReLU, 'sigmoid': nn.Sigmoid, 'tanh': nn.Tanh, 'leaky_relu': nn.LeakyReLU,
+					   'elu': nn.ELU, 'prelu': nn.PReLU, 'softplus': nn.Softplus,'rrelu':nn.RReLU}
+
+		act_func = activations[act]
+		self.network = nn.Sequential(
+			nn.Linear(in_dim, hidden_dim,bias=False), act_func(),
+			nn.Linear(hidden_dim, hidden_dim,bias=False),act_func(),
+			nn.Linear(hidden_dim, out_dim,bias=False),
+		)
+
+	def forward(self, x):
+		return self.network(x)
+
+
+class LinearClamped(nn.Module):
+	'''
+	Linear layer with user-specified parameters (not to be learrned!)
+	'''
+
+	__constants__ = ['bias', 'in_features', 'out_features']
+
+	def __init__(self, in_features, out_features, weights, bias_values, bias=True):
+		super(LinearClamped, self).__init__()
+		self.in_features = in_features
+		self.out_features = out_features
+
+		self.register_buffer('weight', torch.Tensor(weights))
+		if bias:
+			self.register_buffer('bias', torch.Tensor(bias_values))
+
+	def forward(self, input):
+		if input.dim() == 1:
+			return F.linear(input.view(1, -1), self.weight,self.bias)
+		return F.linear(input, self.weight,self.bias)
+
+	def extra_repr(self):
+		return 'in_features={}, out_features={}, bias={}'.format(
+			self.in_features, self.out_features, self.bias is not None
+		)
+
+class LinearClamped1(nn.Module):
+	'''
+	Linear layer with user-specified parameters (not to be learrned!)
+	'''
+
+	__constants__ = ['bias', 'in_features', 'out_features']
+
+	def __init__(self, in_features, out_features, weights, bias_values, bias=False):
+		super(LinearClamped1, self).__init__()
+		self.in_features = in_features
+		self.out_features = out_features
+
+		self.register_buffer('weight', torch.Tensor(weights))
+		if bias:
+			self.register_buffer('bias', torch.Tensor(bias_values))
+
+	def forward(self, input):
+		if input.dim() == 1:
+			return F.linear(input.view(1, -1), self.weight)
+		return F.linear(input, self.weight)
+
+	def extra_repr(self):
+		return 'in_features={}, out_features={}, bias={}'.format(
+			self.in_features, self.out_features, self.bias is not None
+		)
+
+class Cos(nn.Module):
+	"""
+	Applies the cosine element-wise function
+	"""
+
+	def forward(self, inputs):
+		return torch.cos(inputs)
+
+
+class Sin(nn.Module):
+	"""
+	Applies the cosine element-wise function
+	"""
+
+	def forward(self, inputs):
+		return inputs * torch.sigmoid(inputs)
 
 
 
