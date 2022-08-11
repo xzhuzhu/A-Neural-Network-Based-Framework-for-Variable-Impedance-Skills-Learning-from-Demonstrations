@@ -57,7 +57,7 @@ elif coupling_network_type == 'rffn':       # random fourier features parameteri
     batch_size = 64
     s_act = None                            # not required for rffn
     t_act = None                            # not required for rffn
-    learning_rate = 0.00088
+    learning_rate = 0.001
 
 else:
     raise TypeError('Coupling layer network not defined!')
