@@ -352,7 +352,7 @@ class Sin(nn.Module):
 	"""
 
 	def forward(self, inputs):
-		return inputs * torch.sigmoid(inputs)
+		return inputs * torch.cos(inputs)
 
 
 
