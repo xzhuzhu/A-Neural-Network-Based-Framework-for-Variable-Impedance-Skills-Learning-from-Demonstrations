@@ -49,7 +49,7 @@ if coupling_network_type == 'fcnn':         # neural network parameterization
     print('WARNING: FCNN params are not tuned!! ')
 
 elif coupling_network_type == 'rffn':       # random fourier features parameterization
-    num_blocks =8                        # number of coupling layers
+    num_blocks =12                        # number of coupling layers
     num_hidden = 128                        # number of random fourier features per block
     sigma = .65              # length scale for random fourier features
 
