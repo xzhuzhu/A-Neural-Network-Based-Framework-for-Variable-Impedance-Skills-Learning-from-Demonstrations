@@ -8,7 +8,7 @@ Ref: M. Asif Rana et al, Euclideanizing Flows: Diffeomorphic Reduction for Learn
 from __future__ import print_function
 import torch.optim as optim
 from torch.utils.data import TensorDataset
-from flows import *
+from flow import *
 from train_utils import *
 from plot_utils import *
 from data_utils import *
@@ -49,7 +49,7 @@ if coupling_network_type == 'fcnn':         # neural network parameterization
     print('WARNING: FCNN params are not tuned!! ')
 
 elif coupling_network_type == 'rffn':       # random fourier features parameterization
-    num_blocks =12                        # number of coupling layers
+    num_blocks =10                        # number of coupling layers
     num_hidden = 128                        # number of random fourier features per block
     sigma = .65              # length scale for random fourier features
 
